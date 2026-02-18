@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# Local runtime files
+email_config.json
+mima.txt
+
+# Local databases and outputs
+*.db
+*.sqlite
+*.sqlite3

@@ -1,0 +1,74 @@
+name: Mannheim Jobs Hourly
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: mannheim-jobs-hourly
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 deep-translator
+
+      - name: Build secure runtime config from secrets
+        shell: bash
+        run: |
+          cat > email_config.json <<EOF
+          {
+            "provider": "smtp",
+            "translate_title_to_en": true,
+            "to_emails": "${{ secrets.TO_EMAILS }}",
+            "smtp_host": "${{ secrets.SMTP_HOST }}",
+            "smtp_port": ${{ secrets.SMTP_PORT }},
+            "smtp_ssl": true,
+            "smtp_starttls": false,
+            "smtp_user": "${{ secrets.SMTP_USER }}",
+            "smtp_pass": "${{ secrets.SMTP_PASS }}"
+          }
+          EOF
+
+      - name: Restore DB if missing
+        shell: bash
+        run: |
+          if [ ! -f jobs.db ]; then
+            echo "No jobs.db found in repo yet; first run will create it."
+          fi
+
+      - name: Run crawler and send mail
+        run: |
+          python mannheim_jobs_bot.py --send-email --db jobs.db
+
+      - name: Persist DB state
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f jobs.db
+          if git diff --cached --quiet; then
+            echo "No DB changes."
+            exit 0
+          fi
+          git commit -m "chore: update jobs db [skip ci]"
+          git push

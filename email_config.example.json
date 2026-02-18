@@ -1,0 +1,13 @@
+{
+  "provider": "smtp",
+  "translate_title_to_en": true,
+  "to_emails": [
+    "you@example.com"
+  ],
+  "smtp_host": "smtp.qq.com",
+  "smtp_port": 465,
+  "smtp_ssl": true,
+  "smtp_starttls": false,
+  "smtp_user": "your_sender@qq.com",
+  "smtp_pass": "YOUR_QQ_SMTP_AUTH_CODE"
+}
