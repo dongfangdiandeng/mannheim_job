@@ -119,6 +119,15 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS crawler_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
 
 
@@ -583,6 +592,38 @@ def parse_email_list(raw: object) -> List[str]:
     return []
 
 
+def canonicalize_emails(emails: List[str]) -> List[str]:
+    norm = sorted({normalize_ws(e).lower() for e in emails if normalize_ws(e)})
+    return norm
+
+
+def get_state(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute("SELECT value FROM crawler_state WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO crawler_state (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at
+        """,
+        (key, value, utc_now_iso()),
+    )
+
+
+def detect_new_recipients(conn: sqlite3.Connection, current_emails: List[str]) -> Tuple[bool, int]:
+    current = canonicalize_emails(current_emails)
+    prev_raw = get_state(conn, "last_sent_recipients")
+    prev = canonicalize_emails(prev_raw.split(",")) if prev_raw else []
+
+    added = sorted(set(current) - set(prev))
+    return (len(added) > 0, len(added))
+
+
 def send_email_smtp(subject: str, text_body: str, html_body: str, cfg: Dict[str, object], to_emails: List[str]) -> None:
     smtp_host = str(cfg.get("smtp_host", "")).strip()
     smtp_port = int(cfg.get("smtp_port", 587))
@@ -725,25 +766,38 @@ def run(send_mail: bool, include_updates: bool, db_path: str, url: str, email_co
         pending_new = unsent_events(conn, new_jobs, "new")
         pending_updated = unsent_events(conn, updated_jobs, "updated") if include_updates else []
         all_jobs = get_active_jobs(conn)
+        email_cfg: Dict[str, object] = {}
+        to_emails: List[str] = []
+        translate_titles = False
+        recipient_added_trigger = False
+        added_recipients_n = 0
 
-        print_summary(len(jobs), len(new_jobs), len(updated_jobs), removed_n, db_path)
-
-        if send_mail and (pending_new or pending_updated or force_email):
+        if send_mail:
             try:
                 email_cfg = load_email_config(email_config_path)
                 translate_titles = bool(email_cfg.get("translate_title_to_en", False))
+                to_emails = parse_email_list(email_cfg.get("to_emails", []))
+                recipient_added_trigger, added_recipients_n = detect_new_recipients(conn, to_emails)
             except Exception:
                 translate_titles = False
 
+        print_summary(len(jobs), len(new_jobs), len(updated_jobs), removed_n, db_path)
+
+        if send_mail and (pending_new or pending_updated or force_email or recipient_added_trigger):
             email_jobs = attach_english_titles(conn, all_jobs, translate_titles)
             subject = (
                 f"[Jobs Alert] new={len(pending_new)} updated={len(pending_updated)} "
                 f"removed={removed_n} total={len(all_jobs)}"
             )
+            if recipient_added_trigger:
+                subject = f"{subject} recipients+={added_recipients_n}"
             text_body, html_body = build_email_content(email_jobs, pending_new, pending_updated)
             send_email(subject, text_body, html_body, email_config_path)
             mark_sent(conn, pending_new, "new")
             mark_sent(conn, pending_updated, "updated")
+            if to_emails:
+                set_state(conn, "last_sent_recipients", ",".join(canonicalize_emails(to_emails)))
+                conn.commit()
             print("Email sent.")
         elif send_mail:
             print("No unsent events. Email skipped.")
