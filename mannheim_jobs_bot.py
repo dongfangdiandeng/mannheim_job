@@ -18,6 +18,16 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.uni-mannheim.de/en/about/working-at-the-university-of-mannheim/employment-opportunities/"
+ZEW_BASE_URL = "https://www.zew.de/en/career/job-offers"
+ZEW_API_URL = "https://jobs.b-ite.com/api/v1/postings/search"
+ZEW_LISTING_JS_URL = "https://cs-assets.b-ite.com/zew/jobs-api/mitarbeiter-en.js"
+ZEW_DEFAULT_API_KEY = "be2895b17849cf534866c1db3bc9208ff29f8cc6"
+ZEW_CATEGORIES = [
+    "mitarbeiter",
+    "studentische_hilfskraefte",
+    "praktikum",
+    "ausbildung",
+]
 DB_FILE = "jobs.db"
 EMAIL_CONFIG_FILE = "email_config.json"
 UA = "mannheim-jobs-bot/1.0 (+personal use)"
@@ -191,6 +201,81 @@ def parse_open_positions(page_html: str, base_url: str, session: requests.Sessio
         jobs.append(job)
 
     return jobs
+
+
+def zew_api_key(session: requests.Session) -> str:
+    try:
+        js = fetch_html(session, ZEW_LISTING_JS_URL)
+        m = re.search(r'key:\s*"([a-f0-9]{32,64})"', js, flags=re.I)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ZEW_DEFAULT_API_KEY
+
+
+def fetch_zew_jobs(session: requests.Session) -> List[Dict[str, str]]:
+    key = zew_api_key(session)
+    jobs: List[Dict[str, str]] = []
+
+    for cat in ZEW_CATEGORIES:
+        payload = {
+            "key": key,
+            "offset": 0,
+            "limit": 100,
+            "channel": 0,
+            "locale": "en",
+            "sort": {"by": "startsOn", "order": "desc"},
+            "filter": {
+                "custom.zuordnung_homepage": {"in": [cat]},
+                "locale": {"in": ["*"]},
+            },
+        }
+
+        resp = session.post(ZEW_API_URL, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        postings = data.get("jobPostings") or []
+
+        for p in postings:
+            title = normalize_ws(str(p.get("title", "")))
+            url = normalize_ws(str(p.get("url", "")))
+            deadline = normalize_ws(str(p.get("endsOn", "")))
+            if len(deadline) >= 10 and deadline[4] == "-" and deadline[7] == "-":
+                deadline = deadline[:10]
+
+            org = normalize_ws(str((p.get("employer") or {}).get("name", ""))) or "ZEW"
+            field = normalize_ws(str(p.get("employmentType", ""))) or cat
+            raw_text = normalize_ws(
+                " | ".join(
+                    [
+                        title,
+                        normalize_ws(str(p.get("identification", ""))),
+                        deadline,
+                        normalize_ws(str(p.get("anr", ""))),
+                    ]
+                )
+            )
+
+            jobs.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "org": org,
+                    "field": field,
+                    "remuneration": "",
+                    "deadline": deadline,
+                    "source_type": "api",
+                    "raw_text": raw_text,
+                }
+            )
+
+    # Deduplicate postings that appear in multiple categories.
+    uniq: Dict[str, Dict[str, str]] = {}
+    for j in jobs:
+        key = stable_job_key(j["title"], j["org"], j["deadline"], j["url"])
+        uniq[key] = j
+    return list(uniq.values())
 
 
 def upsert_jobs(
@@ -407,7 +492,7 @@ def build_email_content(
     sorted_jobs = sorted(all_jobs, key=sort_key)
 
     text_lines: List[str] = []
-    text_lines.append("Mannheim Jobs Alert")
+    text_lines.append("Jobs Alert")
     text_lines.append("")
     text_lines.append(f"Total active jobs: {len(all_jobs)}")
     text_lines.append(f"New jobs in this run: {len(new_jobs)}")
@@ -466,7 +551,7 @@ def build_email_content(
   <body style="font-family:Segoe UI,Arial,sans-serif;background:#f8fafc;color:#0f172a;padding:16px;">
     <div style="max-width:980px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
       <div style="padding:16px 20px;background:#0f172a;color:#fff;">
-        <h2 style="margin:0;font-size:20px;">Mannheim Jobs Alert</h2>
+        <h2 style="margin:0;font-size:20px;">Jobs Alert</h2>
       </div>
       <div style="padding:16px 20px;">
         <p style="margin:0 0 10px 0;">Total active jobs: <b>{len(all_jobs)}</b> | New: <b>{len(new_jobs)}</b> | Updated: <b>{len(updated_jobs)}</b></p>
@@ -621,9 +706,11 @@ def run(send_mail: bool, include_updates: bool, db_path: str, url: str, email_co
 
     try:
         html = fetch_html(session, url)
-        jobs = parse_open_positions(html, url, session)
+        mannheim_jobs = parse_open_positions(html, url, session)
+        zew_jobs = fetch_zew_jobs(session)
+        jobs = mannheim_jobs + zew_jobs
     except Exception as exc:
-        print(f"ERROR: failed to scrape page: {exc}", file=sys.stderr)
+        print(f"ERROR: failed to scrape source(s): {exc}", file=sys.stderr)
         return 2
 
     if not jobs:
@@ -650,7 +737,7 @@ def run(send_mail: bool, include_updates: bool, db_path: str, url: str, email_co
 
             email_jobs = attach_english_titles(conn, all_jobs, translate_titles)
             subject = (
-                f"[Mannheim Jobs] new={len(pending_new)} updated={len(pending_updated)} "
+                f"[Jobs Alert] new={len(pending_new)} updated={len(pending_updated)} "
                 f"removed={removed_n} total={len(all_jobs)}"
             )
             text_body, html_body = build_email_content(email_jobs, pending_new, pending_updated)
@@ -668,7 +755,7 @@ def run(send_mail: bool, include_updates: bool, db_path: str, url: str, email_co
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scrape University of Mannheim jobs and send email alerts."
+        description="Scrape Mannheim + ZEW jobs and send email alerts."
     )
     parser.add_argument("--url", default=BASE_URL, help="Jobs page URL")
     parser.add_argument("--db", default=DB_FILE, help="SQLite DB file path")
